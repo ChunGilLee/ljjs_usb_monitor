@@ -36,6 +36,13 @@
 #define USB_SCREEN_INTERFACE_NUM 1
 #define TOUCH_EVENT_SCAN_MAX     64   // scan this many event nodes (0..63)
 
+#define AUTO_RANDOM_MOVE
+
+#ifdef AUTO_RANDOM_MOVE
+static uint64_t last_user_input_us = 0;   // 마지막 실제 터치 시각
+static uint64_t last_auto_gen_us   = 0;   // 마지막 랜덤 타겟 생성 시각
+#endif
+
 static uint16_t framebuffer[HEIGHT][WIDTH];
 
 static inline void clear_framebuffer(void) {
@@ -75,6 +82,10 @@ typedef struct {
     int abs_min_y, abs_max_y;
     int last_x,last_y;
     int has_pos;
+    #ifdef AUTO_RANDOM_MOVE
+    int updated;   // <<< ADDED: 새 좌표가 이 프레임에 갱신되었는지 표시
+    #endif
+
 } touch_state_t;
 static touch_state_t g_touch = {0};
 
@@ -268,6 +279,9 @@ static void update_touch_from_event(const struct input_event *ev) {
                 int sx = (int)((long long)(cur_ax - g_touch.abs_min_x) * (WIDTH-1) / (g_touch.abs_max_x - g_touch.abs_min_x));
                 int sy = (int)((long long)(cur_ay - g_touch.abs_min_y) * (HEIGHT-1) / (g_touch.abs_max_y - g_touch.abs_min_y));
                 g_touch.last_x = sx; g_touch.last_y = sy; g_touch.has_pos = 1;
+                #ifdef AUTO_RANDOM_MOVE
+                g_touch.updated = 1;   // <<< ADDED
+                #endif
                 cur_ax = cur_ay = -1;
             }
         }
@@ -280,11 +294,15 @@ static void update_touch_from_event(const struct input_event *ev) {
                 int sx = (int)((long long)(cur_ax - g_touch.abs_min_x) * (WIDTH-1) / (g_touch.abs_max_x - g_touch.abs_min_x));
                 int sy = (int)((long long)(cur_ay - g_touch.abs_min_y) * (HEIGHT-1) / (g_touch.abs_max_y - g_touch.abs_min_y));
                 g_touch.last_x = sx; g_touch.last_y = sy; g_touch.has_pos = 1;
+                #ifdef AUTO_RANDOM_MOVE
+                g_touch.updated = 1;   // <<< ADDED
+                #endif
                 cur_ax = cur_ay = -1;
             }
         }
     }
 }
+
 
 /* ====== send_frame_sync (chunked) as before ====== */
 static int send_frame_sync(libusb_device_handle *h) {
@@ -537,12 +555,17 @@ static inline uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
 }
 
+
 /* main */
 int main(int argc, char *argv[]) {
     const char *explicit_event_path = NULL;
     if (argc >= 2) explicit_event_path = argv[1];
 
     signal(SIGINT, handle_signal); signal(SIGTERM, handle_signal);
+
+    #ifdef AUTO_RANDOM_MOVE
+    srand((unsigned)time(NULL));          // <<< ADDED: rand() 시드
+    #endif
 
     if (libusb_init(&ctx) < 0) { fprintf(stderr,"libusb init failed\n"); return 1; }
     if (connect_device() != 0) { fprintf(stderr,"Device connect failed\n"); libusb_exit(ctx); return 1; }
@@ -582,6 +605,13 @@ int main(int argc, char *argv[]) {
 
     Rect rect = { (WIDTH-RECT_W)/2, (HEIGHT-RECT_H)/2 }, target_rect = rect;
     uint64_t last_frame = now_us();
+
+    #ifdef AUTO_RANDOM_MOVE
+    uint64_t now0 = now_us();             // <<< ADDED
+    last_user_input_us = now0;            // <<< ADDED
+    last_auto_gen_us   = now0;            // <<< ADDED
+    #endif
+
     printf("Streaming frames; rectangle follows touch.\n");
 
     while (keep_running) {
@@ -596,17 +626,49 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        #ifdef AUTO_RANDOM_MOVE
+        g_touch.updated = 0;  // <<< ADDED: 이 프레임에서 새로운 터치 갱신 여부 초기화
+        #endif
+
         struct input_event ev; int rc;
         do {
             rc = libevdev_next_event(touch_info.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
             if (rc == LIBEVDEV_READ_STATUS_SUCCESS || rc == LIBEVDEV_READ_STATUS_SYNC) update_touch_from_event(&ev);
         } while (rc == LIBEVDEV_READ_STATUS_SUCCESS || rc == LIBEVDEV_READ_STATUS_SYNC);
 
+        #ifdef AUTO_RANDOM_MOVE
+        uint64_t now = now_us();   // <<< ADDED: 현재 시각
+
+        if (g_touch.updated) {     // <<< CHANGED: has_pos 대신 updated 사용
+            target_rect.x = g_touch.last_x - RECT_W/2;
+            target_rect.y = g_touch.last_y - RECT_H/2;
+            clamp_rect(&target_rect);
+            last_user_input_us = now;      // <<< ADDED: 마지막 실제 입력 시각 갱신
+        }
+
+        // <<< ADDED: 3초 이상 실제 입력이 없으면, 3초마다 랜덤 위치를 새 타겟으로 설정
+        const uint64_t AUTO_INTERVAL_US = 1000000ULL;  // 3초
+
+        if (!g_touch.updated) {   // 이번 프레임에 실제 터치 갱신이 없을 때만 자동 입력 사용
+            if (now - last_user_input_us >= AUTO_INTERVAL_US &&
+                now - last_auto_gen_us   >= AUTO_INTERVAL_US) {
+                int rx = rand() % (WIDTH  - RECT_W);
+                int ry = rand() % (HEIGHT - RECT_H);
+                target_rect.x = rx;
+                target_rect.y = ry;
+                clamp_rect(&target_rect);
+                last_auto_gen_us = now;
+                // printf("Auto target: (%d, %d)\n", rx, ry);
+            }
+        }
+        #else
         if (g_touch.has_pos) {
             target_rect.x = g_touch.last_x - RECT_W/2;
             target_rect.y = g_touch.last_y - RECT_H/2;
             clamp_rect(&target_rect);
         }
+        #endif
+
         rect.x += (target_rect.x - rect.x) / 4;
         rect.y += (target_rect.y - rect.y) / 4;
         clamp_rect(&rect);
